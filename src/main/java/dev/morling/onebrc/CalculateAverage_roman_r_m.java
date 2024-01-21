@@ -15,159 +15,197 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.File;
-import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.IntStream;
 
 public class CalculateAverage_roman_r_m {
 
-    public static final int DOT_3_RD_BYTE_MASK = (byte) '.' << 16;
     private static final String FILE = "./measurements.txt";
-    private static MemorySegment ms;
 
-    // based on http://0x80.pl/notesen/2023-03-06-swar-find-any.html
-    static long hasZeroByte(long l) {
-        return ((l - 0x0101010101010101L) & ~(l) & 0x8080808080808080L);
-    }
+    private static Unsafe UNSAFE;
 
-    static long firstSetByteIndex(long l) {
-        return ((((l - 1) & 0x101010101010101L) * 0x101010101010101L) >> 56) - 1;
-    }
-
-    static long broadcast(byte b) {
+    private static long broadcast(byte b) {
         return 0x101010101010101L * b;
     }
 
-    static long SEMICOLON_MASK = broadcast((byte) ';');
-    static long LINE_END_MASK = broadcast((byte) '\n');
+    private static final long SEMICOLON_MASK = broadcast((byte) ';');
+    private static final long LINE_END_MASK = broadcast((byte) '\n');
+    private static final long DOT_MASK = broadcast((byte) '.');
 
-    static long find(long l, long mask) {
-        long xor = l ^ mask;
-        long match = hasZeroByte(xor);
-        return match != 0 ? firstSetByteIndex(match) : -1;
+    // from netty
+
+    /**
+     * Applies a compiled pattern to given word.
+     * Returns a word where each byte that matches the pattern has the highest bit set.
+     */
+    private static long applyPattern(final long word, final long pattern) {
+        long input = word ^ pattern;
+        long tmp = (input & 0x7F7F7F7F7F7F7F7FL) + 0x7F7F7F7F7F7F7F7FL;
+        return ~(tmp | input | 0x7F7F7F7F7F7F7F7FL);
     }
 
-    static long nextNewline(long from) {
+    static long nextNewline(long from, MemorySegment ms) {
         long start = from;
         long i;
         long next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, start);
-        while ((i = find(next, LINE_END_MASK)) < 0) {
+        while ((i = applyPattern(next, LINE_END_MASK)) == 0) {
             start += 8;
             next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, start);
         }
-        return start + i;
+        return start + Long.numberOfTrailingZeros(i) / 8;
     }
 
-    public static void main(String[] args) throws IOException {
+    static class Worker {
+        private final MemorySegment ms;
+        private final long end;
+        private long offset;
+
+        public Worker(FileChannel channel, long start, long end) {
+            try {
+                this.ms = channel.map(FileChannel.MapMode.READ_ONLY, start, end - start, Arena.ofConfined());
+                this.offset = ms.address();
+                this.end = ms.address() + end - start;
+            }
+            catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        private void parseName(ByteString station) {
+            long start = offset;
+            long next = UNSAFE.getLong(offset);
+            long pattern = applyPattern(next, SEMICOLON_MASK);
+            int bytes;
+            if (pattern != 0) {
+                bytes = Long.numberOfTrailingZeros(pattern) / 8;
+                offset += bytes;
+                long h = Long.reverseBytes(next) >>> (8 * (8 - bytes));
+                station.hash = (int) (h ^ (h >>> 32));
+            }
+            else {
+                long h = next;
+                station.hash = (int) (h ^ (h >>> 32));
+                while (pattern == 0) {
+                    offset += 8;
+                    next = UNSAFE.getLong(offset);
+                    pattern = applyPattern(next, SEMICOLON_MASK);
+                }
+                bytes = Long.numberOfTrailingZeros(pattern) / 8;
+                offset += bytes;
+            }
+
+            int len = (int) (offset - start);
+            station.offset = start;
+            station.len = len;
+            station.tail = next & ((1L << (8 * bytes)) - 1);
+
+            offset++;
+        }
+
+        int parseNumberFast() {
+            long encodedVal = UNSAFE.getLong(offset);
+
+            int neg = 1 - Integer.bitCount((int) (encodedVal & 0x10));
+            encodedVal >>>= 8 * neg;
+
+            var len = applyPattern(encodedVal, DOT_MASK);
+            len = Long.numberOfTrailingZeros(len) / 8;
+
+            encodedVal ^= broadcast((byte) 0x30);
+
+            int intPart = (int) (encodedVal & ((1 << (8 * len)) - 1));
+            intPart <<= 8 * (2 - len);
+            intPart *= (100 * 256 + 10);
+            intPart = (intPart & 0x3FF80) >>> 8;
+
+            int frac = (int) ((encodedVal >>> (8 * (len + 1))) & 0xFF);
+
+            offset += neg + len + 3; // 1 for . + 1 for fractional part + 1 for new line char
+            int sign = 1 - 2 * neg;
+            int val = intPart + frac;
+            return sign * val;
+        }
+
+        int parseNumberSlow() {
+            int neg = 1 - Integer.bitCount(UNSAFE.getByte(offset) & 0x10);
+            offset += neg;
+
+            int val = UNSAFE.getByte(offset++) - '0';
+            byte b;
+            while ((b = UNSAFE.getByte(offset++)) != '.') {
+                val = val * 10 + (b - '0');
+            }
+            b = UNSAFE.getByte(offset);
+            val = val * 10 + (b - '0');
+            offset += 2;
+            val *= 1 - 2 * neg;
+            return val;
+        }
+
+        int parseNumber() {
+            if (end - offset >= 8) {
+                return parseNumberFast();
+            }
+            else {
+                return parseNumberSlow();
+            }
+        }
+
+        public TreeMap<String, ResultRow> run() {
+            var resultStore = new ResultStore();
+            var station = new ByteString(ms);
+
+            while (offset < end) {
+                parseName(station);
+                long val = parseNumber();
+                var a = resultStore.get(station);
+                a.min = Math.min(a.min, val);
+                a.max = Math.max(a.max, val);
+                a.sum += val;
+                a.count++;
+            }
+            return resultStore.toMap();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Field f = Unsafe.class.getDeclaredField("theUnsafe");
+        f.setAccessible(true);
+        UNSAFE = (Unsafe) f.get(null);
+
         long fileSize = new File(FILE).length();
 
         var channel = FileChannel.open(Paths.get(FILE));
-        ms = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.ofAuto());
+        MemorySegment ms = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.ofConfined());
 
         int numThreads = fileSize > Integer.MAX_VALUE ? Runtime.getRuntime().availableProcessors() : 1;
         long chunk = fileSize / numThreads;
+
+        var bounds = IntStream.range(0, numThreads).mapToLong(i -> {
+            boolean lastChunk = i == numThreads - 1;
+            return lastChunk ? fileSize : nextNewline((i + 1) * chunk, ms);
+        }).toArray();
+
+        ms.unload();
+
         var result = IntStream.range(0, numThreads)
                 .parallel()
                 .mapToObj(i -> {
-                    boolean lastChunk = i == numThreads - 1;
-                    long chunkStart = i == 0 ? 0 : nextNewline(i * chunk) + 1;
-                    long chunkEnd = lastChunk ? fileSize : nextNewline((i + 1) * chunk);
-
-                    var resultStore = new ResultStore();
-                    var station = new ByteString();
-
-                    long offset = chunkStart;
-                    while (offset < chunkEnd) {
-                        long start = offset;
-                        long pos;
-
-                        if (!lastChunk || chunkEnd - offset >= 8) {
-                            long next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
-
-                            while ((pos = find(next, SEMICOLON_MASK)) < 0) {
-                                offset += 8;
-                                if (!lastChunk || fileSize - offset >= 8) {
-                                    next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
-                                }
-                                else {
-                                    while (ms.get(ValueLayout.JAVA_BYTE, offset + pos) != ';') {
-                                        pos++;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        else {
-                            pos = 0;
-                            while (ms.get(ValueLayout.JAVA_BYTE, offset + pos) != ';') {
-                                pos++;
-                            }
-                        }
-                        offset += pos;
-                        int len = (int) (offset - start);
-                        // TODO can we not copy and use a reference into the memory segment to perform table lookup?
-                        MemorySegment.copy(ms, ValueLayout.JAVA_BYTE, start, station.buf, 0, len);
-                        station.len = len;
-                        station.hash = 0;
-
-                        offset++;
-
-                        long val;
-                        boolean neg;
-                        if (!lastChunk || fileSize - offset >= 8) {
-                            long encodedVal = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
-                            neg = (encodedVal & (byte) '-') == (byte) '-';
-                            if (neg) {
-                                encodedVal >>= 8;
-                                offset++;
-                            }
-
-                            if ((encodedVal & DOT_3_RD_BYTE_MASK) == DOT_3_RD_BYTE_MASK) {
-                                val = (encodedVal & 0xFF - 0x30) * 100 + (encodedVal >> 8 & 0xFF - 0x30) * 10 + (encodedVal >> 24 & 0xFF - 0x30);
-                                offset += 5;
-                            }
-                            else {
-                                // based on http://0x80.pl/articles/simd-parsing-int-sequences.html#parsing-and-conversion-of-signed-numbers
-                                val = Long.compress(encodedVal, 0xFF00FFL) - 0x303030;
-                                val = ((val * 2561) >> 8) & 0xff;
-                                offset += 4;
-                            }
-                        }
-                        else {
-                            neg = ms.get(ValueLayout.JAVA_BYTE, offset) == '-';
-                            if (neg) {
-                                offset++;
-                            }
-                            val = ms.get(ValueLayout.JAVA_BYTE, offset++) - '0';
-                            byte b;
-                            while ((b = ms.get(ValueLayout.JAVA_BYTE, offset++)) != '.') {
-                                val = val * 10 + (b - '0');
-                            }
-                            b = ms.get(ValueLayout.JAVA_BYTE, offset);
-                            val = val * 10 + (b - '0');
-                            offset += 2;
-                        }
-
-                        if (neg) {
-                            val = -val;
-                        }
-
-                        var a = resultStore.get(station);
-                        a.min = Math.min(a.min, val);
-                        a.max = Math.max(a.max, val);
-                        a.sum += val;
-                        a.count++;
-                    }
-                    return resultStore.toMap();
+                    long start = i == 0 ? 0 : bounds[i - 1] + 1;
+                    long end = bounds[i];
+                    Worker worker = new Worker(channel, start, end);
+                    var res = worker.run();
+                    worker.ms.unload();
+                    return res;
                 }).reduce((m1, m2) -> {
                     m2.forEach((k, v) -> m1.merge(k, v, ResultRow::merge));
                     return m1;
@@ -178,23 +216,27 @@ public class CalculateAverage_roman_r_m {
 
     static final class ByteString {
 
-        private byte[] buf = new byte[100];
+        private final MemorySegment ms;
+        private long offset;
         private int len = 0;
         private int hash = 0;
+        private long tail = 0L;
 
-        @Override
-        public String toString() {
-            return new String(buf, 0, len);
+        ByteString(MemorySegment ms) {
+            this.ms = ms;
+        }
+
+        public String asString(byte[] reusable) {
+            UNSAFE.copyMemory(null, offset, reusable, Unsafe.ARRAY_BYTE_BASE_OFFSET, len);
+            return new String(reusable, 0, len);
         }
 
         public ByteString copy() {
-            var copy = new ByteString();
+            var copy = new ByteString(ms);
+            copy.offset = this.offset;
             copy.len = this.len;
             copy.hash = this.hash;
-            if (copy.buf.length < this.buf.length) {
-                copy.buf = new byte[this.buf.length];
-            }
-            System.arraycopy(this.buf, 0, copy.buf, 0, this.len);
+            copy.tail = this.tail;
             return copy;
         }
 
@@ -210,24 +252,25 @@ public class CalculateAverage_roman_r_m {
             if (len != that.len)
                 return false;
 
-            // TODO use Vector
-            for (int i = 0; i < len; i++) {
-                if (buf[i] != that.buf[i]) {
+            for (int i = 0; i + 7 < len; i += 8) {
+                long l1 = UNSAFE.getLong(offset + i);
+                long l2 = UNSAFE.getLong(that.offset + i);
+                if (l1 != l2) {
                     return false;
                 }
             }
-
-            return true;
+            return this.tail == that.tail;
         }
 
         @Override
         public int hashCode() {
-            if (hash == 0) {
-                for (int i = 0; i < len; i++) {
-                    hash = 31 * hash + (buf[i] & 255);
-                }
-            }
             return hash;
+        }
+
+        @Override
+        public String toString() {
+            byte[] buf = new byte[100];
+            return asString(buf);
         }
     }
 
@@ -255,25 +298,41 @@ public class CalculateAverage_roman_r_m {
     }
 
     static class ResultStore {
-        private final ArrayList<ResultRow> results = new ArrayList<>(10000);
-        private final Map<ByteString, Integer> indices = new HashMap<>(10000);
+        private static final int SIZE = 16384;
+        private final ByteString[] keys = new ByteString[SIZE];
+        private final ResultRow[] values = new ResultRow[SIZE];
 
         ResultRow get(ByteString s) {
-            var idx = indices.get(s);
-            if (idx != null) {
-                return results.get(idx);
+            int h = s.hashCode();
+            int idx = (SIZE - 1) & h;
+
+            int i = 0;
+            while (keys[idx] != null && !keys[idx].equals(s)) {
+                i++;
+                idx = (idx + i * i) % SIZE;
+            }
+            ResultRow result;
+            if (keys[idx] == null) {
+                keys[idx] = s.copy();
+                result = new ResultRow();
+                values[idx] = result;
             }
             else {
-                ResultRow next = new ResultRow();
-                results.add(next);
-                indices.put(s.copy(), results.size() - 1);
-                return next;
+                result = values[idx];
+                // TODO see it it makes any difference
+                // keys[idx].offset = s.offset;
             }
+            return result;
         }
 
         TreeMap<String, ResultRow> toMap() {
+            byte[] buf = new byte[100];
             var result = new TreeMap<String, ResultRow>();
-            indices.forEach((name, idx) -> result.put(name.toString(), results.get(idx)));
+            for (int i = 0; i < SIZE; i++) {
+                if (keys[i] != null) {
+                    result.put(keys[i].asString(buf), values[i]);
+                }
+            }
             return result;
         }
     }
